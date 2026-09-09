@@ -226,21 +226,26 @@ export default function POSPage({ onNavigate }: Props) {
               </span>
             )}
           </div>
-          <div className="flex items-center gap-3">
-            {heldSales.length > 0 && (
-              <button onClick={() => setShowHeldSales(true)} className="inline-flex items-center gap-1 text-xs font-semibold text-violet-700 hover:text-violet-800">
-                <PlayCircle size={15}/> Bekletilen ({heldSales.length})
-              </button>
-            )}
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setShowHeldSales(true)}
+              className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-violet-700 hover:bg-violet-50"
+              title="Bekletilen satışları görüntüle"
+            >
+              <PlayCircle size={15}/> Bekletilen ({heldSales.length})
+            </button>
+            <button
+              onClick={holdCurrentSale}
+              disabled={cart.length === 0}
+              className="inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-sm font-semibold text-amber-600 hover:bg-amber-50 disabled:cursor-not-allowed disabled:opacity-40"
+              title={cart.length ? 'Mevcut satışı askıya al' : 'Askıya almak için sepete ürün ekleyin'}
+            >
+              <PauseCircle size={16}/> Askıya Al
+            </button>
             {cart.length > 0 && (
-              <div className="flex items-center gap-3">
-                <button onClick={holdCurrentSale} className="inline-flex items-center gap-1 text-sm font-semibold text-amber-600 hover:text-amber-700">
-                  <PauseCircle size={16}/> Askıya Al
-                </button>
-                <button onClick={clearCart} className="text-sm text-red-500 hover:text-red-600">
-                  Temizle
-                </button>
-              </div>
+              <button onClick={clearCart} className="rounded-lg px-2 py-1.5 text-sm text-red-500 hover:bg-red-50 hover:text-red-600">
+                Temizle
+              </button>
             )}
           </div>
         </div>
