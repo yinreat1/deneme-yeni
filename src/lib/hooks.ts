@@ -162,28 +162,22 @@ export async function updateProduct(id: string, p: Partial<Omit<Product, 'id' | 
 }
 
 export async function deleteProduct(id: string): Promise<boolean> {
-  // Ürünü fiziksel olarak silme; çöp kutusuna taşı.
-  const { error } = await supabase
-    .from('products')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id);
-  if (error) {
-    console.error('Ürün çöp kutusuna taşınamadı:', error);
-    return false;
-  }
-  await writeAudit('product_deleted', 'product', id);
-  return true;
+  // Önce çöp kutusuna taşı; kolon/migration yoksa gerçek silmeye geri dön.
+  const { error } = await supabase.from('products').update({ deleted_at: new Date().toISOString() }).eq('id', id);
+  if (!error) { await writeAudit('product_deleted', 'product', id); return true; }
+  const msg = `${error.message || ''} ${error.code || ''}`.toLowerCase();
+  const missingDeletedAt = msg.includes('deleted_at') || msg.includes('schema cache') || msg.includes('42703');
+  if (missingDeletedAt) {
+    const hard = await supabase.from('products').delete().eq('id', id);
+    if (!hard.error) { await writeAudit('product_hard_deleted', 'product', id); return true; }
+    console.error('Ürün fiziksel olarak da silinemedi:', hard.error);
+  } else console.error('Ürün çöp kutusuna taşınamadı:', error);
+  return false;
 }
 
 export async function restoreProduct(id: string): Promise<boolean> {
-  const { error } = await supabase
-    .from('products')
-    .update({ deleted_at: null })
-    .eq('id', id);
-  if (error) {
-    console.error('Ürün geri yüklenemedi:', error);
-    return false;
-  }
+  const { error } = await supabase.from('products').update({ deleted_at: null }).eq('id', id);
+  if (error) { console.error('Ürün geri yüklenemedi:', error); return false; }
   await writeAudit('product_restored', 'product', id);
   return true;
 }
@@ -260,6 +254,51 @@ export async function completeSale(
       }]
   ).filter(p => Number(p.amount) > 0);
 
+  // Migration uygulanmışsa satışın tamamını atomik RPC ile sunucuda bitir.
+  // Eski kurulumlarda RPC yoksa aşağıdaki uyumluluk akışına geri dönülür.
+  const rpcItems = items.map((item) => {
+    const unitPrice = cartUnitPrice(item);
+    const originalUnitPrice = Number(item.product.price);
+    return {
+      productId: item.product.id,
+      productName: item.product.name,
+      barcode: item.product.barcode,
+      quantity: Number(item.quantity),
+      unitPrice: Number(unitPrice),
+      originalUnitPrice,
+      discountAmount: +((originalUnitPrice - unitPrice) * item.quantity).toFixed(2),
+    };
+  });
+  const rpcSplits = splits.map(p => ({ method: p.method, amount: Number(p.amount), customerId: p.customerId || null }));
+  try {
+    const { data: atomicSaleId, error: atomicError } = await supabase.rpc('complete_sale_atomic', {
+      p_total: +total.toFixed(2),
+      p_payment_method: paymentMethod,
+      p_paid_amount: +(paymentMethod === 'split' ? total : paidAmount).toFixed(2),
+      p_customer_id: customerId || null,
+      p_customer_name: customerName || null,
+      p_original_total: +originalTotal.toFixed(2),
+      p_discount_total: discountTotal,
+      p_client_ref: clientRef || null,
+      p_items: rpcItems,
+      p_splits: rpcSplits,
+    });
+    if (!atomicError && atomicSaleId) {
+      const [{ data: atomicSale, error: atomicSaleError }, { data: atomicItems }] = await Promise.all([
+        supabase.from('sales').select('*').eq('id', atomicSaleId).single(),
+        supabase.from('sale_items').select('*').eq('sale_id', atomicSaleId),
+      ]);
+      if (!atomicSaleError && atomicSale) {
+        await writeAudit('sale_completed', 'sale', atomicSale.id, { total, paymentMethod, itemCount: items.length, atomic: true });
+        return { ...atomicSale, sale_items: (atomicItems || []) as SaleItem[] } as SaleWithItems;
+      }
+    } else if (atomicError && !/complete_sale_atomic|schema cache|function .* does not exist|could not find the function|404/i.test(atomicError.message || '')) {
+      console.warn('Atomik satış RPC başarısız; uyumlu fallback kullanılacak:', atomicError);
+    }
+  } catch (err) {
+    console.warn('Atomik satış RPC kullanılamadı; uyumlu fallback kullanılacak:', err);
+  }
+
   if (paymentMethod === 'split') {
     const splitTotal = splits.reduce((a, p) => a + Number(p.amount || 0), 0);
     if (Math.abs(splitTotal - total) > 0.01) return null;
@@ -307,20 +346,17 @@ export async function completeSale(
     const original = Number(item.product.price);
     return { sale_id: sale.id, product_id: item.product.id, product_name: item.product.name, barcode: item.product.barcode, quantity: item.quantity, unit_price: unit, subtotal: +(unit * item.quantity).toFixed(2), original_unit_price: original, discount_amount: +((original-unit)*item.quantity).toFixed(2) };
   });
-  let itemsResult = await supabase.from('sale_items').insert(saleItems);
+  let itemsResult:any, paymentResult:any;
+  [itemsResult, paymentResult] = await Promise.all([
+    supabase.from('sale_items').insert(saleItems),
+    splits.length > 0 ? supabase.from('sale_payments').insert(splits.map(p => ({ sale_id: sale.id, method: p.method, amount: p.amount }))) : Promise.resolve({error:null})
+  ]);
   if (itemsResult.error && /original_unit_price|discount_amount|schema cache|column/i.test(itemsResult.error.message || '')) {
     const legacySaleItems = saleItems.map(({ original_unit_price, discount_amount, ...row }) => row);
     itemsResult = await supabase.from('sale_items').insert(legacySaleItems);
   }
   if (itemsResult.error) { await supabase.from('sales').delete().eq('id', sale.id); console.error('Satış kalemleri kaydedilemedi:', itemsResult.error); return null; }
-
-  let payError: { message?: string } | null = null;
-  if (splits.length > 0) {
-    const paymentInsert = await supabase.from('sale_payments').insert(
-      splits.map(p => ({ sale_id: sale.id, method: p.method, amount: p.amount }))
-    );
-    payError = paymentInsert.error;
-  }
+  let payError: { message?: string } | null = paymentResult?.error || null;
   // sale_payments tablosu eski kurulumlarda olmayabilir; bu durumda ana satış yine kaydedilsin.
   if (payError && !/sale_payments|schema cache|relation|does not exist|Could not find the table/i.test(payError.message || '')) {
     // Ödeme kırılımı yardımcı kayıttır; ana satışın tamamlanmasını engellemesin.
@@ -344,36 +380,43 @@ export async function completeSale(
     await supabase.from('sales').delete().eq('id', sale.id);
   };
 
-  for (const item of items) {
+  const stockRows = await Promise.all(items.map(async (item) => {
     const { data: currentProduct, error: prodErr } = await supabase.from('products').select('stock,name').eq('id', item.product.id).single();
-    if (prodErr || !currentProduct || Number(currentProduct.stock) < item.quantity) {
-      await rollbackSale();
-      return null;
-    }
-    const before = Number(currentProduct.stock);
-    const ok = await supabase.rpc('record_stock_movement', { p_product_id:item.product.id, p_type:'sale', p_quantity:item.quantity, p_reason:`Satış ${sale.id}`, p_sale_id:sale.id, p_staff_id:null });
-    // RPC çağrısı hata vermeden false dönerse de stok düşmemiş olabilir.
-    if (ok.error || ok.data !== true) {
-      const nextStock = before - Number(item.quantity);
-      if (nextStock < 0) {
-        await rollbackSale();
-        console.error('Stok düşülemedi: yetersiz stok');
-        return null;
-      }
-      const fallbackStock = await supabase.from('products').update({ stock: nextStock }).eq('id', item.product.id);
-      if (fallbackStock.error) {
-        await rollbackSale();
-        console.error('Stok düşülemedi:', ok.error, fallbackStock.error);
-        return null;
-      }
-      const movementResult = await supabase.from('stock_movements').insert({product_id:item.product.id,product_name:currentProduct.name,movement_type:'sale',quantity:item.quantity,before_stock:before,after_stock:nextStock,sale_id:sale.id});
-      if (movementResult.error && !/stock_movements|schema cache|relation|does not exist/i.test(movementResult.error.message || '')) {
-        await rollbackSale();
-        return null;
-      }
-    }
-    appliedStock.push({ productId: item.product.id, quantity: Number(item.quantity), before, name: currentProduct.name });
+    return { item, currentProduct, prodErr };
+  }));
+  if (stockRows.some(r => r.prodErr || !r.currentProduct || Number(r.currentProduct.stock) < Number(r.item.quantity))) {
+    await Promise.all([
+      supabase.from('sale_items').delete().eq('sale_id', sale.id),
+      supabase.from('sale_payments').delete().eq('sale_id', sale.id),
+      supabase.from('sales').delete().eq('id', sale.id)
+    ]);
+    return null;
   }
+  const stockResults = await Promise.all(stockRows.map(async ({item,currentProduct}) => {
+    const before = Number(currentProduct!.stock);
+    const ok = await supabase.rpc('record_stock_movement', { p_product_id:item.product.id, p_type:'sale', p_quantity:item.quantity, p_reason:`Satış ${sale.id}`, p_sale_id:sale.id, p_staff_id:null });
+    if (!ok.error && ok.data === true) return { success:true, productId:item.product.id, quantity:Number(item.quantity), before, name:currentProduct!.name };
+    const nextStock = before - Number(item.quantity);
+    if (nextStock < 0) return { success:false, productId:item.product.id, quantity:Number(item.quantity), before, name:currentProduct!.name };
+    const fallbackStock = await supabase.from('products').update({ stock: nextStock }).eq('id', item.product.id);
+    if (fallbackStock.error) return { success:false, productId:item.product.id, quantity:Number(item.quantity), before, name:currentProduct!.name };
+    const movementResult = await supabase.from('stock_movements').insert({product_id:item.product.id,product_name:currentProduct!.name,movement_type:'sale',quantity:item.quantity,before_stock:before,after_stock:nextStock,sale_id:sale.id});
+    if (movementResult.error && !/stock_movements|schema cache|relation|does not exist/i.test(movementResult.error.message || '')) return { success:false, productId:item.product.id, quantity:Number(item.quantity), before, name:currentProduct!.name };
+    return { success:true, productId:item.product.id, quantity:Number(item.quantity), before, name:currentProduct!.name };
+  }));
+  if (stockResults.some(r => !r.success)) {
+    await Promise.all(stockResults.filter(r => r.success).map(async row => {
+      const restored = await supabase.rpc('record_stock_movement', { p_product_id: row.productId, p_type: 'return', p_quantity: row.quantity, p_reason: `Satış geri alma ${sale.id}`, p_sale_id: sale.id, p_staff_id: null });
+      if (restored.error || restored.data !== true) await supabase.from('products').update({ stock: row.before }).eq('id', row.productId);
+    }));
+    await Promise.all([
+      supabase.from('sale_items').delete().eq('sale_id', sale.id),
+      supabase.from('sale_payments').delete().eq('sale_id', sale.id),
+      supabase.from('sales').delete().eq('id', sale.id)
+    ]);
+    return null;
+  }
+  appliedStock.push(...stockResults.filter(r => r.success).map(r => ({productId:r.productId, quantity:r.quantity, before:r.before, name:r.name})));
 
   const creditPart = splits.filter(p => p.method === 'credit').reduce((sum,p)=>sum+p.amount,0);
   if (creditPart > 0) {
@@ -462,10 +505,19 @@ export function useStaff() {
 export async function addStaff(name:string,pin?:string,role:Staff['role']='cashier'){
   const clean=name.trim();
   if(!clean) return {data:null,error:'Ad Soyad zorunludur.' as string};
-  const {data,error}=await supabase.from('staff').insert({name:clean,pin:pin||null,role,active:true}).select().single();
-  if (!error && data) { const rows=getLocalStaff().filter(x=>x.id!==data.id); saveLocalStaff([...rows,data as Staff]); return {data:data as Staff,error:null}; }
+  if(!pin || pin.trim().length < 4) return {data:null,error:'PIN / Şifre en az 4 karakter olmalı.' as string};
+  let {data,error}=await supabase.from('staff').insert({name:clean,pin:null,role,active:true}).select().single();
+  if (!error && data) {
+    const pinResult=await supabase.rpc('set_staff_pin',{p_staff_id:data.id,p_pin:pin.trim()});
+    if(pinResult.error || pinResult.data!==true){
+      const fallback=await supabase.from('staff').update({pin:pin.trim()}).eq('id',data.id);
+      if(fallback.error){ await supabase.from('staff').delete().eq('id',data.id); return {data:null,error:pinResult.error?.message||fallback.error.message||'PIN kaydedilemedi.'}; }
+      data={...data,pin:pin.trim()};
+    } else data={...data,pin:null,pin_hash:'stored'} as any;
+    const rows=getLocalStaff().filter(x=>x.id!==data.id); saveLocalStaff([...rows,data as Staff]); return {data:data as Staff,error:null};
+  }
   if (isMissingStaffTable(error)) {
-    const local:Staff={id:crypto.randomUUID(),name:clean,pin:pin||null,role,active:true,created_at:new Date().toISOString()};
+    const local:Staff={id:crypto.randomUUID(),name:clean,pin:pin.trim(),role,active:true,created_at:new Date().toISOString()};
     saveLocalStaff([...getLocalStaff(),local]); return {data:local,error:null,local:true};
   }
   console.error('Personel eklenemedi:',error); return {data:null,error:error?.message||'Personel eklenemedi.' as string};
@@ -478,7 +530,14 @@ export async function updateStaff(id:string, patch:Partial<Staff>){
   console.error('Personel güncellenemedi:',error); return false;
 }
 
-export async function deleteStaff(id:string){ return updateStaff(id,{active:false}); }
+export async function deleteStaff(id:string){
+  const {error}=await supabase.from('staff').delete().eq('id',id);
+  if(!error){ saveLocalStaff(getLocalStaff().filter(x=>x.id!==id)); return true; }
+  const fallback=await supabase.from('staff').update({active:false}).eq('id',id);
+  if(!fallback.error){ saveLocalStaff(getLocalStaff().map(x=>x.id===id?{...x,active:false}:x)); return true; }
+  if(isMissingStaffTable(error) || isMissingStaffTable(fallback.error)){ saveLocalStaff(getLocalStaff().filter(x=>x.id!==id)); return true; }
+  console.error('Personel silinemedi:',error,fallback.error); return false;
+}
 
 const OFFLINE_QUEUE_KEY='propos-offline-sales-v2';
 export type OfflineSalePayload = {
@@ -657,60 +716,98 @@ export async function payCustomerDebt(id: string, amount: number, note?: string)
   } catch {
     // Eski veritabanında ödeme tablosu yoksa bakiye yine güncellenmiş olur.
   }
+  // Migration henüz uygulanmadıysa da mümkünse kapanan açık veresiye kayıtlarını işaretle.
+  if (Number(cust.balance || 0) - payment <= 0.01) {
+    const { data: customerRow } = await supabase.from('customers').select('name').eq('id', id).maybeSingle();
+    let settleQuery = supabase.from('sales').update({ settled_at: new Date().toISOString() }).is('settled_at', null).in('payment_method', ['credit','split']);
+    if (customerRow?.name) {
+      settleQuery = settleQuery.or(`customer_id.eq.${id},and(customer_id.is.null,customer_name.eq.${customerRow.name.replace(/,/g, '')})`);
+    } else {
+      settleQuery = settleQuery.eq('customer_id', id);
+    }
+    await settleQuery;
+  }
   return { success: true, amount: payment };
 }
 
 export function useCustomerDebtHistory(customerId: string | null) {
   const [sales, setSales] = useState<SaleWithItems[]>([]);
+  const [archiveSales, setArchiveSales] = useState<SaleWithItems[]>([]);
   const [payments, setPayments] = useState<CustomerPayment[]>([]);
   const [currentBalance, setCurrentBalance] = useState<number | null>(null);
+  const [customerName, setCustomerName] = useState<string>('');
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     if (!customerId) {
-      setSales([]);
-      setPayments([]);
-      setCurrentBalance(null);
+      setSales([]); setArchiveSales([]); setPayments([]); setCurrentBalance(null); setCustomerName('');
       return;
     }
 
     setLoading(true);
     const customerResult = await supabase
       .from('customers')
-      .select('balance')
+      .select('name,balance')
       .eq('id', customerId)
       .maybeSingle();
 
-    let salesResult = await supabase
-      .from('sales')
-      .select('*, sale_items(*)')
-      .eq('customer_id', customerId)
-      .eq('payment_method', 'credit')
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false });
+    const name = customerResult.data?.name || '';
+    setCustomerName(name);
 
-    if (salesResult.error && /deleted_at|schema cache|column/i.test(salesResult.error.message || '')) {
-      salesResult = await supabase
+    async function fetchSaleRows(includeSettled: boolean) {
+      const byId = supabase
         .from('sales')
         .select('*, sale_items(*)')
         .eq('customer_id', customerId)
-        .eq('payment_method', 'credit')
-        .order('created_at', { ascending: false });
+        .in('payment_method', ['credit','split'])
+        .order('created_at', { ascending: false })
+        .range(0, 9999);
+
+      let primary = await byId;
+      if (primary.error && /deleted_at|settled_at|schema cache|column/i.test(primary.error.message || '')) {
+        primary = await supabase
+          .from('sales')
+          .select('*, sale_items(*)')
+          .eq('customer_id', customerId)
+          .in('payment_method', ['credit','split'])
+          .order('created_at', { ascending: false });
+      }
+
+      let rows = (primary.data || []) as SaleWithItems[];
+      // Eski sürümlerde müşteri_id yazılmadan yalnızca müşteri adı kaydedilmiş olabilir.
+      if (name) {
+        const legacy = await supabase
+          .from('sales')
+          .select('*, sale_items(*)')
+          .eq('customer_name', name)
+          .in('payment_method', ['credit','split'])
+          .order('created_at', { ascending: false })
+          .range(0, 9999);
+        if (!legacy.error) {
+          const merged = [...rows, ...((legacy.data || []) as SaleWithItems[])];
+          const seen = new Set<string>();
+          rows = merged.filter((x) => !seen.has(x.id) && seen.add(x.id));
+        }
+      }
+
+      rows.sort((a:any,b:any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+      if (!includeSettled) {
+        rows = rows.filter((sale: any) => sale.settled_at == null);
+      } else {
+        rows = rows.filter((sale: any) => sale.settled_at != null);
+      }
+      return rows;
     }
 
-    const { data: paymentData, error: paymentError } = await supabase
-      .from('customer_payments')
-      .select('*')
-      .eq('customer_id', customerId)
-      .order('created_at', { ascending: false });
+    const [activeSales, settledSales, paymentResult] = await Promise.all([
+      fetchSaleRows(false),
+      fetchSaleRows(true),
+      supabase.from('customer_payments').select('*').eq('customer_id', customerId).order('created_at', { ascending: false }).range(0, 9999),
+    ]);
 
-    if (salesResult.error) console.error('Veresiye geçmişi yüklenemedi:', salesResult.error);
-    if (paymentError && !/customer_payments|schema cache|relation/i.test(paymentError.message || '')) {
-      console.error('Ödeme geçmişi yüklenemedi:', paymentError);
-    }
-
-    setSales((salesResult.data || []) as SaleWithItems[]);
-    setPayments((paymentData || []) as CustomerPayment[]);
+    setSales(activeSales);
+    setArchiveSales(settledSales);
+    setPayments((paymentResult.data || []) as CustomerPayment[]);
     setCurrentBalance(customerResult.data ? Number(customerResult.data.balance || 0) : null);
     setLoading(false);
   }, [customerId]);
@@ -727,8 +824,9 @@ export function useCustomerDebtHistory(customerId: string | null) {
     return () => { supabase.removeChannel(channel); };
   }, [customerId, load]);
 
-  return { sales, payments, currentBalance, loading, reload: load };
+  return { sales, archiveSales, payments, currentBalance, customerName, loading, reload: load };
 }
+
 
 
 // ===== Kasa Oturumları =====

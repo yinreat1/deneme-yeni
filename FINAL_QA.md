@@ -13,3 +13,15 @@
 
 ## Runtime limitation
 Full npm dependency installation/build could not be completed in the sandbox because the package install transport timed out. The delivered source was inspected statically; a local `npm ci && npm run typecheck && npm run build` is still required before production deployment.
+
+## Release note
+- GitHub/Vercel deployment files included: `.env.example`, `DEPLOY_VERCEL.md`.
+- Production dependency install/build could not be completed in this sandbox because npm registry transport timed out and the local cache is incomplete. This is an environment limitation, not a claim of a successful production build.
+- `@zxing/library@0.23.0` declares Node.js >=24. Use a Vercel runtime/Node version that satisfies this engine requirement.
+
+
+## Cari hesap arşiv düzeltmesi
+- Veresiye satışlar ürün kalemleri ile sorgulanır.
+- Eski müşteri_id eksik kayıtlar müşteri adıyla da bulunur.
+- Borç 0 olduğunda aktif hesap temizlenir ve satışlar settled_at ile arşive alınır.
+- Eski Sayfalar sekmesinden geçmiş ürünler ve kapanış tarihi görünür.

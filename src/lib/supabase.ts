@@ -1,7 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://nmwswdjqqcunpupdrbwi.supabase.co';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5td3N3ZGpxcWN1bnB1cGRyYndpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3NDg1NDUsImV4cCI6MjEwMjMyNDU0NX0.-6LLtBO_9S5rGMEWVg-kJFIhSVDzNnMJB274tqmIDzI';
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://ukfeuojhigxxxlnhsmls.supabase.co';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_b-cFhb97kOd3mLQnBi_SGQ_8oNQPkzS';
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
@@ -42,6 +42,7 @@ export type Sale = {
   created_at: string;
   deleted_at: string | null;
   deleted_reason: string | null;
+  settled_at: string | null;
   refunded_at: string | null;
   refund_amount: number | null;
   refund_reason: string | null;
@@ -96,4 +97,4 @@ export type CashSession = {
 
 export type SalePayment = { id: string; sale_id: string; method: 'cash'|'card'|'credit'; amount: number; created_at: string };
 export type StockMovement = { id:string; product_id:string|null; product_name:string; movement_type:'in'|'out'|'adjustment'|'sale'|'return'|'waste'; quantity:number; before_stock:number; after_stock:number; reason:string|null; sale_id:string|null; staff_id:string|null; created_at:string };
-export type Staff = { id:string; name:string; pin:string|null; role:'admin'|'manager'|'cashier'; active:boolean; created_at:string };
+export type Staff = { id:string; name:string; pin:string|null; pin_hash?:string|null; role:'admin'|'manager'|'cashier'; active:boolean; created_at:string };
